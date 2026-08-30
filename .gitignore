@@ -1,0 +1,14 @@
+# Rendered output (regenerate with `python3 export.py`)
+*.png
+*.json
+
+# Only track .blend files in assets/
+assets/*
+!assets/*.blend
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
