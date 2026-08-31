@@ -39,6 +39,33 @@ Scene conventions:
     is how you add a custom shot (an icon/portrait camera, say) alongside
     the 4 standard directions. Extra cameras are always rendered with their
     own settings, same as an explicitly-named standard camera.
+  - Every view is also rendered a second time with every object's material
+    overridden (bpy ViewLayer.material_override) to a Material named
+    "normals" (case-insensitive), producing a "*_normal.png" alongside that
+    view's regular image and a "normal_image" key in its manifest entry.
+    If the asset's own scene has such a material, that one is used —
+    otherwise one is linked in automatically from SHARED_MATERIALS_BLEND
+    (see ensure_normals_material()), so assets get normal maps for free
+    without each one needing its own copy. Add a "normals" material
+    directly to a specific asset only if it needs its own custom bake;
+    otherwise edit SHARED_MATERIALS_BLEND once and every asset picks it up.
+    That material's shader graph is what defines the bake: Geometry Normal
+    -> Vector Transform (World to Camera) -> encode to [0,1] -> Emission,
+    so the render captures each view's surface normal in that view's own
+    screen space (+X right, +Y up, +Z toward the viewer) instead of the
+    object's real appearance. Blender's Vector Transform node negates Z
+    relative to the camera object's own local axes (X/Y match the camera's
+    right/up exactly; verified empirically, not documented anywhere) — the
+    graph in SHARED_MATERIALS_BLEND multiplies by (1, 1, -1) right after
+    the Vector Transform to flip it back to "+Z toward the viewer" before
+    encoding. Preserve that flip if you ever rebuild the graph from scratch.
+    If neither the asset nor the shared file has a "normals" material, no
+    normal maps are rendered for that asset.
+    The normal-map render forces the scene's view transform to "Raw" for
+    that one render — the encoded [0,1] values are data, not a color to be
+    graded, so the artist's AgX/Filmic/etc. look (which is nonlinear and
+    would distort them, e.g. skewing hues and shrinking decoded vectors to
+    sub-unit length) must not touch them. The color pass is unaffected.
   - For auto-generated cameras, render resolution is derived from the
     fitted frame × png_px_per_unit. For artist-placed cameras (standard or
     extra), the scene's existing render resolution is used as-is, since
@@ -65,6 +92,8 @@ STANDARD_DIRECTIONS = {
     "SE": Vector((1, -1, 0)),
 }
 
+SHARED_MATERIALS_BLEND = Path(__file__).parent / "shared_materials.blend"
+
 
 def die(msg):
     print(f"error: {msg}", file=sys.stderr)
@@ -74,6 +103,25 @@ def die(msg):
 def sanitize_name(name: str) -> str:
     """Normalizes a camera or Empty name for use as a manifest key."""
     return name.lower()
+
+
+def find_material(name: str):
+    """Case-insensitive lookup of a Material by name, or None."""
+    return next((m for m in bpy.data.materials if m.name.lower() == name.lower()), None)
+
+
+def ensure_normals_material():
+    """The asset's own "normals" material if it has one; otherwise one
+    appended from SHARED_MATERIALS_BLEND, so assets need not each carry
+    their own copy of the normal-map bake. None if neither has one."""
+    mat = find_material("normals")
+    if mat is not None or not SHARED_MATERIALS_BLEND.exists():
+        return mat
+    with bpy.data.libraries.load(str(SHARED_MATERIALS_BLEND), link=False) as (data_from, data_to):
+        if "normals" not in data_from.materials:
+            return None
+        data_to.materials = ["normals"]
+    return data_to.materials[0]
 
 
 def world_bounds(objects):
@@ -230,17 +278,33 @@ def main():
             }
         return result
 
+    normals_material = ensure_normals_material()
+    view_layer = bpy.context.view_layer
+
     views = {}
     for key, (cam_obj, res_x, res_y) in {**standard_render, **extra_render}.items():
         out_png = out_dir / f"{stem}_{key}.png"
         render_camera(scene, cam_obj, out_png, res_x, res_y)
-        views[key] = {
+        view = {
             "image": out_png.name,
             "render_width_px": res_x,
             "render_height_px": res_y,
             "anchors": anchors_for(cam_obj),
         }
         print(f"rendered {out_png.name}: {res_x}x{res_y}")
+
+        if normals_material is not None:
+            out_normal_png = out_dir / f"{stem}_{key}_normal.png"
+            view_layer.material_override = normals_material
+            view_transform = scene.view_settings.view_transform
+            scene.view_settings.view_transform = "Raw"
+            render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
+            scene.view_settings.view_transform = view_transform
+            view_layer.material_override = None
+            view["normal_image"] = out_normal_png.name
+            print(f"rendered {out_normal_png.name}: {res_x}x{res_y}")
+
+        views[key] = view
 
     manifest = {
         "schema_version": 1,

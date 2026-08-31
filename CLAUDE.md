@@ -39,13 +39,14 @@ Two-process pipeline, split because rendering requires Blender's Python (`bpy`) 
 - Four standard 45°-isometric directions are always rendered: NE/NW/SE/SW (compass azimuth in Blender's XY plane, +Y = north). If the scene has a Camera object named after one of those (case-insensitive), its own transform/lens/resolution is used as-is; otherwise one is auto-created and orthographically fit to the bounding box.
 - Any other Camera object in the scene is rendered too, as an extra view keyed by its own object name (e.g. a `hero_inventory` camera for an item's inventory-icon shot, distinct from its in-world/equipped views).
 - Every Empty in the scene is a named anchor point (e.g. `head`, `weapon_socket`). All camera/direction and Empty names are lowercased (`sanitize_name()`) before becoming manifest keys.
+- Every view is rendered a second time with `ViewLayer.material_override` set to a Material named `normals` (case-insensitive) — the asset's own if it has one, else one auto-linked from `shared_materials.blend` — producing a `*_normal.png` per view; the render forces `view_settings.view_transform = "Raw"` so AgX/Filmic doesn't distort the encoded values. That material's shader graph (Geometry Normal → Vector Transform World→Camera → multiply by `(1,1,-1)` to undo a Z-negation quirk in Blender's Vector Transform node → encode to `[0,1]` → Emission) bakes each view's surface normal into its own screen space. No `normals` material anywhere means no normal maps.
 
 ### Manifest shape (schema v1)
 
 Single JSON manifest per asset: `{schema_version, asset, views}`. `views` is keyed by direction label or camera name — there's no separate top-level table for directions vs. extra cameras vs. anchors; anchors live *nested inside* each view:
 
 ```
-views.<key> = { image, render_width_px, render_height_px, anchors }
+views.<key> = { image, normal_image?, render_width_px, render_height_px, anchors }
 views.<key>.anchors.<name> = { offset: [-0.5..0.5, -0.5..0.5], visible: bool }
 ```
 

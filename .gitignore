@@ -5,6 +5,7 @@
 # Only track .blend files in assets/
 assets/*
 !assets/*.blend
+*.blend1
 
 # macOS
 .DS_Store
