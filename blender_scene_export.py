@@ -70,6 +70,28 @@ Scene conventions:
     fitted frame × png_px_per_unit. For artist-placed cameras (standard or
     extra), the scene's existing render resolution is used as-is, since
     their framing isn't ours to reinterpret.
+  - A .blend file can hold multiple independent assets as sibling
+    Collections directly under the scene's root collection (Collection >
+    New Collection in the Outliner, not nested inside one another). With
+    2+ such collections, each is rendered as its own asset — its own
+    bounding box, standard directions, extra cameras, and anchors, scoped
+    to just the objects in that collection (recursively, via
+    Collection.all_objects) — and the manifest becomes schema v2:
+    {schema_version: 2, assets: {<collection>: {asset, views}, ...}}
+    keyed by sanitize_name(collection.name), with image filenames
+    "<stem>_<collection>_<view>.png" to keep them from colliding. Every
+    *other* top-level collection is hidden from render (Collection.hide_
+    render) while each one's views are rendered, so one asset's geometry
+    never bleeds into another's frame — put shared scene furniture (e.g. a
+    single sun light meant to illuminate every asset) directly in the
+    scene's root collection, outside any of the per-asset collections, so
+    it's never toggled off. With 0 or 1 top-level collections, none of
+    this applies — the whole scene is one asset, exactly as if this
+    feature didn't exist: schema v1, "<stem>_<view>.png" filenames, same
+    as always. This is what makes the feature backward compatible: a
+    scene that happens to keep everything in a single habitual collection
+    (a common Blender authoring habit unrelated to wanting multiple
+    exported assets) is unaffected.
 
 Usage:
   blender <asset>.blend --background --python blender_scene_export.py -- \\
@@ -215,23 +237,13 @@ def render_camera(scene, cam_obj, out_png, resolution_x, resolution_y):
     bpy.ops.render.render(write_still=True)
 
 
-def main():
-    argv = sys.argv[sys.argv.index("--") + 1:]
-    if len(argv) != 4:
-        die("expected args: <out_dir> <px_per_unit> <png_px_per_unit> <pitch_deg>")
-    out_dir, px_per_unit, png_px_per_unit, pitch_deg = argv
-    px_per_unit = float(px_per_unit)
-    png_px_per_unit = float(png_px_per_unit)
-    pitch_deg = float(pitch_deg)
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(bpy.data.filepath).stem
-
-    scene = bpy.context.scene
-    mesh_objs = [o for o in scene.objects if o.type not in ("EMPTY", "CAMERA", "LIGHT")]
+def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, png_px_per_unit, pitch_deg):
+    """Renders one asset's standard directions, extra cameras, and normal
+    maps from `objects`, writing "<name_prefix>_<view>[_normal].png" files.
+    Returns this asset's {asset, views} manifest entry."""
+    mesh_objs = [o for o in objects if o.type not in ("EMPTY", "CAMERA", "LIGHT")]
     if not mesh_objs:
-        die(f"no mesh objects found in {bpy.data.filepath}")
+        die(f"no mesh objects found for asset {asset_name!r} in {bpy.data.filepath}")
 
     bbox_min, bbox_max = world_bounds(mesh_objs)
     center = (bbox_min + bbox_max) / 2
@@ -239,9 +251,9 @@ def main():
     corners = bbox_corners(bbox_min, bbox_max)
     distance = max(size.length, 1.0) * 4
 
-    empties = [o for o in scene.objects if o.type == "EMPTY"]
+    empties = [o for o in objects if o.type == "EMPTY"]
 
-    all_cams = [o for o in scene.objects if o.type == "CAMERA"]
+    all_cams = [o for o in objects if o.type == "CAMERA"]
     standard_cams = {}
     for label in STANDARD_DIRECTIONS:
         match = next((o for o in all_cams if o.name.upper() == label), None)
@@ -283,7 +295,7 @@ def main():
 
     views = {}
     for key, (cam_obj, res_x, res_y) in {**standard_render, **extra_render}.items():
-        out_png = out_dir / f"{stem}_{key}.png"
+        out_png = out_dir / f"{name_prefix}_{key}.png"
         render_camera(scene, cam_obj, out_png, res_x, res_y)
         view = {
             "image": out_png.name,
@@ -294,7 +306,7 @@ def main():
         print(f"rendered {out_png.name}: {res_x}x{res_y}")
 
         if normals_material is not None:
-            out_normal_png = out_dir / f"{stem}_{key}_normal.png"
+            out_normal_png = out_dir / f"{name_prefix}_{key}_normal.png"
             view_layer.material_override = normals_material
             view_transform = scene.view_settings.view_transform
             scene.view_settings.view_transform = "Raw"
@@ -306,16 +318,53 @@ def main():
 
         views[key] = view
 
-    manifest = {
-        "schema_version": 1,
+    return {
         "asset": {
-            "name": stem,
+            "name": asset_name,
             "source": Path(bpy.data.filepath).name,
             "px_per_unit": px_per_unit,
             "bbox_size": [size.x, size.y, size.z],
         },
         "views": views,
     }
+
+
+def main():
+    argv = sys.argv[sys.argv.index("--") + 1:]
+    if len(argv) != 4:
+        die("expected args: <out_dir> <px_per_unit> <png_px_per_unit> <pitch_deg>")
+    out_dir, px_per_unit, png_px_per_unit, pitch_deg = argv
+    px_per_unit = float(px_per_unit)
+    png_px_per_unit = float(png_px_per_unit)
+    pitch_deg = float(pitch_deg)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(bpy.data.filepath).stem
+
+    scene = bpy.context.scene
+    collections = list(scene.collection.children)
+
+    if len(collections) < 2:
+        asset = render_asset(scene, scene.objects, out_dir, stem, stem, px_per_unit, png_px_per_unit, pitch_deg)
+        manifest = {"schema_version": 1, **asset}
+    else:
+        assets = {}
+        for coll in collections:
+            key = sanitize_name(coll.name)
+            original_hide = {c: c.hide_render for c in collections}
+            for c in collections:
+                c.hide_render = c is not coll
+            try:
+                assets[key] = render_asset(
+                    scene, coll.all_objects, out_dir, f"{stem}_{key}", key,
+                    px_per_unit, png_px_per_unit, pitch_deg,
+                )
+            finally:
+                for c, hide_render in original_hide.items():
+                    c.hide_render = hide_render
+        manifest = {"schema_version": 2, "assets": assets}
+
     out_json = out_dir / f"{stem}.json"
     with out_json.open("w") as f:
         json.dump(manifest, f, indent=2)

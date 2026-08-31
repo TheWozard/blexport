@@ -40,10 +40,18 @@ Two-process pipeline, split because rendering requires Blender's Python (`bpy`) 
 - Any other Camera object in the scene is rendered too, as an extra view keyed by its own object name (e.g. a `hero_inventory` camera for an item's inventory-icon shot, distinct from its in-world/equipped views).
 - Every Empty in the scene is a named anchor point (e.g. `head`, `weapon_socket`). All camera/direction and Empty names are lowercased (`sanitize_name()`) before becoming manifest keys.
 - Every view is rendered a second time with `ViewLayer.material_override` set to a Material named `normals` (case-insensitive) — the asset's own if it has one, else one auto-linked from `shared_materials.blend` — producing a `*_normal.png` per view; the render forces `view_settings.view_transform = "Raw"` so AgX/Filmic doesn't distort the encoded values. That material's shader graph (Geometry Normal → Vector Transform World→Camera → multiply by `(1,1,-1)` to undo a Z-negation quirk in Blender's Vector Transform node → encode to `[0,1]` → Emission) bakes each view's surface normal into its own screen space. No `normals` material anywhere means no normal maps.
+- With 2+ Collections directly under the scene's root collection, each is rendered as its own independent asset (`render_asset()` in `blender_scene_export.py`), scoped to just that collection's own objects (`Collection.all_objects`, so nested sub-collections count too) — its own bounding box, cameras, anchors, and normal maps, with every *other* top-level collection's `hide_render` forced on during that asset's renders so they can't bleed into each other's frame. Filenames get the collection name spliced in: `<stem>_<collection>_<view>.png`. With 0 or 1 top-level collections this doesn't kick in at all — the whole scene is one asset, same as always.
 
-### Manifest shape (schema v1)
+### Manifest shape
 
-Single JSON manifest per asset: `{schema_version, asset, views}`. `views` is keyed by direction label or camera name — there's no separate top-level table for directions vs. extra cameras vs. anchors; anchors live *nested inside* each view:
+Single JSON manifest per **file**, not per asset: `{schema_version, ...}`. Two shapes depending on collection count (see above):
+
+```
+schema_version 1 (0 or 1 top-level collections): { schema_version, asset, views }
+schema_version 2 (2+ top-level collections):     { schema_version, assets: { <collection>: { asset, views }, ... } }
+```
+
+`views` is keyed by direction label or camera name — there's no separate top-level table for directions vs. extra cameras vs. anchors; anchors live *nested inside* each view:
 
 ```
 views.<key> = { image, normal_image?, render_width_px, render_height_px, anchors }
@@ -52,4 +60,4 @@ views.<key>.anchors.<name> = { offset: [-0.5..0.5, -0.5..0.5], visible: bool }
 
 The key design point: an anchor's `offset` and `visible` are computed **per view**, not once globally — the same world-space Empty projects to a different screen position in each camera's own frame (this matters especially for custom/extra cameras, which may not share the standard directions' projection convention at all). `offset` is normalized so a consuming engine multiplies it directly by that view's own rendered sprite size to get a pixel offset from the sprite's center. `visible` comes from a scene ray-cast (`anchor_visible()`) so a 2D engine can decide whether to draw an anchor's overlay behind or in front of the sprite.
 
-See the README's "JSON manifest schema" section for a full worked example, and "Scene conventions" for the camera-matching and resolution rules in prose.
+See the README's "JSON manifest schema" section for full worked examples of both schema versions, and "Scene conventions" for the camera-matching, resolution, and multi-collection rules in prose.

@@ -60,17 +60,26 @@ def render_blend(blend: Path, out_dir: Path, px_per_unit: float, png_px_per_unit
         return json.load(f)
 
 
+def summarize_views(views: dict) -> str:
+    n_dirs = sum(1 for key in views if key.lower() in ("ne", "nw", "se", "sw"))
+    n_extra = len(views) - n_dirs
+    n_anchors = len(next(iter(views.values()), {}).get("anchors", {}))
+    return f"{n_dirs} direction(s), {n_extra} extra camera(s), {n_anchors} anchor(s)"
+
+
 def process(blend: Path, out_dir: Path, args) -> bool:
     print(f"{blend.name}:")
     data = render_blend(blend, out_dir, args.px_per_unit, args.px_per_unit * args.supersample, args.pitch)
     if data is None:
         return False
     manifest = out_dir / f"{blend.stem}.json"
-    views = data.get("views", {})
-    n_dirs = sum(1 for key in views if key.lower() in ("ne", "nw", "se", "sw"))
-    n_extra = len(views) - n_dirs
-    n_anchors = len(next(iter(views.values()), {}).get("anchors", {}))
-    print(f"  wrote {manifest.name} ({n_dirs} direction(s), {n_extra} extra camera(s), {n_anchors} anchor(s))")
+    assets = data.get("assets")
+    if assets is not None:
+        print(f"  wrote {manifest.name} ({len(assets)} asset(s)):")
+        for name, asset in assets.items():
+            print(f"    {name}: {summarize_views(asset.get('views', {}))}")
+    else:
+        print(f"  wrote {manifest.name} ({summarize_views(data.get('views', {}))})")
     return True
 
 
