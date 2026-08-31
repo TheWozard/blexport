@@ -92,6 +92,42 @@ Scene conventions:
     scene that happens to keep everything in a single habitual collection
     (a common Blender authoring habit unrelated to wanting multiple
     exported assets) is unaffected.
+  - An asset's objects can need to render both in front of AND behind some
+    of its own other geometry at once — e.g. glasses whose temple arm tucks
+    behind the ear while the lenses sit in front of the face — which a
+    single flat sprite can't represent. Flip an object's own "Holdout"
+    visibility flag on in the Object Properties panel (bpy: Object.is_
+    holdout) to opt that asset into an automatic front/back split. "image"
+    keeps its usual meaning and is always present — a normal render with
+    the holdout object(s) hidden entirely, i.e. the complete, unoccluded
+    view of everything else — but a view where those objects actually
+    occlude something also gets an "overlay_image": just the part nearer
+    to camera than the holdout object(s) (a per-pixel cutout via Object.
+    is_holdout toggled True for that one render, using Blender's own
+    Z-test rather than a depth buffer or compositor graph of our own),
+    meant to be drawn again on top of whatever the consuming engine draws
+    in between "image" and it (e.g. the holdout object's own real
+    on-screen representation) so that part isn't lost to the occlusion. A
+    consuming engine draws, in fixed order: image -> [whatever occupies
+    the holdout's own space] -> overlay_image (if present). Any number of
+    objects can have the Holdout flag set; all of them are used together.
+    Holdout objects are never themselves rendered as color — they exist
+    purely to cut the hole, and the export script only ever reads the flag
+    (never sets it permanently). See split_front_back() for the mechanism,
+    including why layering the overlay directly onto the same complete
+    "image" (rather than computing two complementary alpha masks that
+    together must reconstruct full coverage, as an earlier version of this
+    tool did) avoids a faint seam along the cutout's antialiased edge. An
+    asset with no holdout-flagged object is unaffected by any of this — no
+    "overlay_image" ever appears, same as always. Holdout objects still
+    count toward the asset's own bounding box (see above), same as any
+    other mesh object, so author them to match the size/position of
+    whatever they represent (e.g. a stand-in copy of a head an accessory
+    sits on) if you want the frame sized/positioned to match it. Each
+    asset (top-level collection, or the whole scene with 0/1 of them) is
+    scanned for its own holdout-flagged objects independently of every
+    other asset's — there's no cross-collection reference or shared camera
+    involved.
 
 Usage:
   blender <asset>.blend --background --python blender_scene_export.py -- \\
@@ -237,21 +273,73 @@ def render_camera(scene, cam_obj, out_png, resolution_x, resolution_y):
     bpy.ops.render.render(write_still=True)
 
 
-def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, png_px_per_unit, pitch_deg):
-    """Renders one asset's standard directions, extra cameras, and normal
-    maps from `objects`, writing "<name_prefix>_<view>[_normal].png" files.
-    Returns this asset's {asset, views} manifest entry."""
-    mesh_objs = [o for o in objects if o.type not in ("EMPTY", "CAMERA", "LIGHT")]
-    if not mesh_objs:
-        die(f"no mesh objects found for asset {asset_name!r} in {bpy.data.filepath}")
+def set_holdout(objects, value):
+    for obj in objects:
+        obj.is_holdout = value
 
-    bbox_min, bbox_max = world_bounds(mesh_objs)
+
+def split_front_back(scene, cam_obj, image_png, overlay_png, res_x, res_y, base_objects, alpha_eps=1e-3):
+    """Renders this view against `base_objects` (see the module docstring's
+    front/back-split section). `image_png` gets a normal render with
+    `base_objects` hidden entirely — the complete, unoccluded render of
+    everything else, always correct and meant to be drawn first regardless
+    of occlusion. `overlay_png` gets a second render with `base_objects`
+    visible but flagged Object.is_holdout (a per-pixel cutout wherever
+    they're nearer to camera, using Blender's own Z-test rather than a
+    depth buffer or compositor graph of our own) — just the part nearer
+    than `base_objects`, meant to be drawn again on top of whatever the
+    consuming engine draws in between (e.g. `base_objects`'s own on-screen
+    representation), so that part isn't lost to the occlusion.
+
+    Returns True if `overlay_png` is actually needed for this view — some
+    pixel really is occluded by `base_objects` — and False if nothing in
+    the frame sits behind them at all, in which case `overlay_png` is
+    deleted; the caller should drop the "overlay_image" key entirely rather
+    than point at a redundant, identical file.
+
+    Compositing the overlay directly on top of the same complete
+    `image_png` (rather than computing two complementary alpha masks that
+    must together reconstruct full coverage, as an earlier version of this
+    function did) avoids a double-transparency seam along the cutout's
+    antialiased edge: `image_png` already has full/correct alpha wherever
+    it's genuinely opaque, so alpha-compositing any fractional-alpha
+    overlay of the same underlying color on top can't reduce coverage below
+    1 there — whereas summing two independently-antialiased partial-alpha
+    layers falls just short of 1 right at the boundary, showing up as a
+    faint seam."""
+    original_hide = [(obj, obj.hide_render) for obj in base_objects]
+    for obj in base_objects:
+        obj.hide_render = True
+    render_camera(scene, cam_obj, image_png, res_x, res_y)
+
+    for obj, _ in original_hide:
+        obj.hide_render = False
+    set_holdout(base_objects, True)
+    render_camera(scene, cam_obj, overlay_png, res_x, res_y)
+    set_holdout(base_objects, False)
+    for obj, hide_render in original_hide:
+        obj.hide_render = hide_render
+
+    image_img = bpy.data.images.load(str(image_png))
+    overlay_img = bpy.data.images.load(str(overlay_png))
+    image_alpha = image_img.pixels[3::4]
+    overlay_alpha = overlay_img.pixels[3::4]
+    needed = any(a - b > alpha_eps for a, b in zip(image_alpha, overlay_alpha))
+    bpy.data.images.remove(image_img)
+    bpy.data.images.remove(overlay_img)
+
+    if not needed:
+        overlay_png.unlink()
+    return needed
+
+
+def compute_camera_set(scene, objects, bbox_min, bbox_max, pitch_deg, png_px_per_unit):
+    """Matches/creates the standard-direction and extra cameras for
+    `objects`'s bounding box. Returns a dict of view key -> (cam_obj,
+    res_x, res_y), covering both standard directions and extra cameras."""
     center = (bbox_min + bbox_max) / 2
-    size = bbox_max - bbox_min
     corners = bbox_corners(bbox_min, bbox_max)
-    distance = max(size.length, 1.0) * 4
-
-    empties = [o for o in objects if o.type == "EMPTY"]
+    distance = max((bbox_max - bbox_min).length, 1.0) * 4
 
     all_cams = [o for o in objects if o.type == "CAMERA"]
     standard_cams = {}
@@ -278,6 +366,18 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
         res_x, res_y = scene.render.resolution_x, scene.render.resolution_y
         extra_render[sanitize_name(cam_obj.name)] = (cam_obj, res_x, res_y)
 
+    return {**standard_render, **extra_render}
+
+
+def render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=None):
+    """Renders each view in `camera_set` (key -> (cam_obj, res_x, res_y)),
+    writing "<name_prefix>_<view>[_normal].png" files, and returns this
+    asset's `views` manifest dict. If `base_objects` is given (this asset's
+    own objects with Object.is_holdout set), "image" always renders as the
+    complete view (those objects hidden entirely) and views where they
+    actually occlude something also get an "overlay_image" (see
+    split_front_back() and the module docstring's front/back-split
+    section)."""
     depsgraph = bpy.context.evaluated_depsgraph_get()
 
     def anchors_for(cam_obj):
@@ -294,15 +394,23 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
     view_layer = bpy.context.view_layer
 
     views = {}
-    for key, (cam_obj, res_x, res_y) in {**standard_render, **extra_render}.items():
+    for key, (cam_obj, res_x, res_y) in camera_set.items():
         out_png = out_dir / f"{name_prefix}_{key}.png"
-        render_camera(scene, cam_obj, out_png, res_x, res_y)
+        overlay_needed = False
+        if base_objects is None:
+            render_camera(scene, cam_obj, out_png, res_x, res_y)
+        else:
+            out_overlay_png = out_dir / f"{name_prefix}_{key}_overlay.png"
+            overlay_needed = split_front_back(scene, cam_obj, out_png, out_overlay_png, res_x, res_y, base_objects)
+
         view = {
             "image": out_png.name,
             "render_width_px": res_x,
             "render_height_px": res_y,
             "anchors": anchors_for(cam_obj),
         }
+        if overlay_needed:
+            view["overlay_image"] = out_overlay_png.name
         print(f"rendered {out_png.name}: {res_x}x{res_y}")
 
         if normals_material is not None:
@@ -310,7 +418,15 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
             view_layer.material_override = normals_material
             view_transform = scene.view_settings.view_transform
             scene.view_settings.view_transform = "Raw"
-            render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
+            if base_objects is None:
+                render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
+            else:
+                original_hide = [(obj, obj.hide_render) for obj in base_objects]
+                for obj in base_objects:
+                    obj.hide_render = True
+                render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
+                for obj, hide_render in original_hide:
+                    obj.hide_render = hide_render
             scene.view_settings.view_transform = view_transform
             view_layer.material_override = None
             view["normal_image"] = out_normal_png.name
@@ -318,7 +434,29 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
 
         views[key] = view
 
-    return {
+    return views
+
+
+def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, png_px_per_unit, pitch_deg):
+    """Renders one asset's views (see render_views()) from `objects`.
+    Returns this asset's {asset, views} manifest entry. Any object in
+    `objects` with its own Object.is_holdout flag set (see the module
+    docstring's front/back-split section) drives an automatic front/back
+    split for every other object in this same asset."""
+    mesh_objs = [o for o in objects if o.type not in ("EMPTY", "CAMERA", "LIGHT")]
+    if not mesh_objs:
+        die(f"no mesh objects found for asset {asset_name!r} in {bpy.data.filepath}")
+
+    bbox_min, bbox_max = world_bounds(mesh_objs)
+    size = bbox_max - bbox_min
+
+    camera_set = compute_camera_set(scene, objects, bbox_min, bbox_max, pitch_deg, png_px_per_unit)
+
+    empties = [o for o in objects if o.type == "EMPTY"]
+    holdout_objs = [o for o in mesh_objs if o.is_holdout]
+    views = render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=holdout_objs or None)
+
+    asset = {
         "asset": {
             "name": asset_name,
             "source": Path(bpy.data.filepath).name,
@@ -327,6 +465,7 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
         },
         "views": views,
     }
+    return asset
 
 
 def main():
@@ -351,18 +490,19 @@ def main():
     else:
         assets = {}
         for coll in collections:
-            key = sanitize_name(coll.name)
+            asset_key = sanitize_name(coll.name)
             original_hide = {c: c.hide_render for c in collections}
             for c in collections:
                 c.hide_render = c is not coll
             try:
-                assets[key] = render_asset(
-                    scene, coll.all_objects, out_dir, f"{stem}_{key}", key,
+                assets[asset_key] = render_asset(
+                    scene, coll.all_objects, out_dir, f"{stem}_{asset_key}", asset_key,
                     px_per_unit, png_px_per_unit, pitch_deg,
                 )
             finally:
                 for c, hide_render in original_hide.items():
                     c.hide_render = hide_render
+
         manifest = {"schema_version": 2, "assets": assets}
 
     out_json = out_dir / f"{stem}.json"
