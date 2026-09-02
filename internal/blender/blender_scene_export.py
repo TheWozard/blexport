@@ -44,17 +44,28 @@ Scene conventions:
     is how you add a custom shot (an icon/portrait camera, say) alongside
     the 4 standard directions. Extra cameras are always rendered with their
     own settings, same as an explicitly-named standard camera.
-  - Every material in the scene must be authored as a single Diffuse BSDF
-    node feeding directly into its Material Output's Surface input — that's
-    the only supported material setup (a hard error otherwise, see
-    diffuse_bsdf_node()) — because it's what every view's two bakes are
-    derived from, per material, instead of the scene's own lighting:
-      - "image" (always present) is an *albedo* pass: whatever feeds the
-        Diffuse BSDF's Color input is plugged into an Emission shader
-        instead, so the render is exactly that surface's own flat base
-        color, self-illuminated — no scene lighting, shadow, or shading
-        gradient baked in. A consuming engine applies all real lighting
-        itself at runtime, using this plus "normal_image" below.
+  - A material authored as a single Diffuse BSDF node feeding directly into
+    its Material Output's Surface input (see diffuse_bsdf_node()) gets the
+    full two-bake treatment described below, derived from that BSDF's own
+    inputs instead of the scene's own lighting. A material that ISN'T wired
+    that way (e.g. Principled BSDF, Emission, anything else) still exports —
+    there's no hard error — but only gets a degraded version of each bake
+    (see build_bake_materials()): the color pass renders that material
+    completely as-is, under the scene's actual lighting, since there's no
+    known Color input to isolate from it; the normal pass renders flat black
+    instead of an encoded normal, since there's no known Normal input to
+    resolve either — "no normal interaction" is the signal to a consuming
+    engine that this surface has no usable normal data for that pass, rather
+    than a plausible-looking but meaningless vector.
+      - "image" (always present) is an *albedo* pass for a Diffuse-BSDF
+        material: whatever feeds the Diffuse BSDF's Color input is plugged
+        into an Emission shader instead, so the render is exactly that
+        surface's own flat base color, self-illuminated — no scene
+        lighting, shadow, or shading gradient baked in. A consuming engine
+        applies all real lighting itself at runtime, using this plus
+        "normal_image" below. (For a non-Diffuse-BSDF material, see above —
+        this isolation doesn't happen and the material's own shader is
+        rendered unmodified instead.)
       - "normal_image" (always present) encodes each view's surface normal
         in that view's own screen space (+X right, +Y up, +Z toward the
         viewer), sourced from each material's own Diffuse BSDF Normal
@@ -77,6 +88,8 @@ Scene conventions:
         encoded values are data, not a color to be graded, so AgX/Filmic/
         etc. (nonlinear, would skew hues and shrink decoded vectors to
         sub-unit length) must not touch them. The color pass is unaffected.
+        (For a non-Diffuse-BSDF material, see above — this whole encoding
+        is skipped and the pass is just flat black.)
       Both bakes run on a temporary Material.copy() per source material
       (see build_bake_materials()), swapped into every mesh object's
       material slots only for that one render and always removed afterward
@@ -201,8 +214,15 @@ def diffuse_bsdf_node(mat):
 def _replace_surface_with_emission(tree, color_socket_or_value):
     """Points `tree`'s active Material Output Surface at a fresh Emission
     shader instead, fed by `color_socket_or_value` (an output socket to
-    link, or a plain RGBA value)."""
-    output = next(n for n in tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output)
+    link, or a plain RGBA value). Creates a Material Output node if `tree`
+    has none (e.g. an empty node tree with use_nodes on but no nodes
+    authored) — such a material has no Surface to isolate a color/normal
+    from anyway, so this is only ever reached via _wire_black_normal_bake()
+    for that case."""
+    output = next((n for n in tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None)
+    if output is None:
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        output.is_active_output = True
     emission = tree.nodes.new("ShaderNodeEmission")
     if isinstance(color_socket_or_value, bpy.types.NodeSocket):
         tree.links.new(color_socket_or_value, emission.inputs["Color"])
@@ -256,22 +276,34 @@ def _wire_normal_bake(mat):
     _replace_surface_with_emission(tree, encode.outputs["Vector"])
 
 
+def _wire_black_normal_bake(mat):
+    """Rewires `mat` (already a throwaway copy) so its Surface is a flat
+    black Emission, regardless of whatever shader it had before — the
+    normal-map pass for a material with no Diffuse BSDF, and so no known
+    Normal input to resolve. Flat black signals "no normal interaction" to
+    a consuming engine rather than encoding a plausible-looking but
+    meaningless vector."""
+    _replace_surface_with_emission(mat.node_tree, (0.0, 0.0, 0.0, 1.0))
+
+
 def build_bake_materials(mat, cache):
-    """(color_mat, normal_mat) throwaway Material.copy()s of `mat`, rewired
-    for the albedo and normal-map passes (see _wire_color_bake()/
-    _wire_normal_bake()). Cached in `cache` (keyed by `mat.name`) since
-    multiple objects/slots commonly share one source material — built once,
-    reused for every view. Dies if `mat` has no Diffuse BSDF driving its
-    Surface output; there's no fallback material or convention anymore."""
+    """(color_mat, normal_mat) throwaway Material.copy()s of `mat` for the
+    albedo and normal-map passes. Cached in `cache` (keyed by `mat.name`)
+    since multiple objects/slots commonly share one source material — built
+    once, reused for every view. If `mat` has a Diffuse BSDF driving its
+    Surface output, both copies are rewired per the module docstring
+    (_wire_color_bake()/_wire_normal_bake()). Otherwise there's no known
+    Color/Normal input to isolate: `color_mat` is left as `mat`'s own
+    unmodified copy (rendered exactly as authored, under scene lighting) and
+    `normal_mat` is rewired to flat black (_wire_black_normal_bake()) —
+    "no normal interaction" rather than a hard error."""
     if mat.name not in cache:
-        if diffuse_bsdf_node(mat) is None:
-            die(
-                f"material {mat.name!r} must have a Diffuse BSDF connected directly to its "
-                f"Material Output Surface input (the only supported material setup) in {bpy.data.filepath}"
-            )
         color_mat, normal_mat = mat.copy(), mat.copy()
-        _wire_color_bake(color_mat)
-        _wire_normal_bake(normal_mat)
+        if diffuse_bsdf_node(mat) is not None:
+            _wire_color_bake(color_mat)
+            _wire_normal_bake(normal_mat)
+        else:
+            _wire_black_normal_bake(normal_mat)
         cache[mat.name] = (color_mat, normal_mat)
     return cache[mat.name]
 
@@ -560,7 +592,7 @@ def render_views(scene, out_dir, name_prefix, camera_set, empties, mesh_objs, ba
     for obj in mesh_objs:
         for slot in obj.material_slots:
             if slot.material is not None:
-                build_bake_materials(slot.material, bake_cache)  # dies eagerly on an unsupported material
+                build_bake_materials(slot.material, bake_cache)  # builds eagerly so every material's bake exists up front
     color_mat_for = lambda mat: build_bake_materials(mat, bake_cache)[0]
     normal_mat_for = lambda mat: build_bake_materials(mat, bake_cache)[1]
 
