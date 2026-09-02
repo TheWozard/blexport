@@ -33,7 +33,12 @@ Scene conventions:
     artist control. Any standard direction with no matching camera gets one
     created here: positioned on the corresponding compass diagonal, pitched
     down by --pitch (true isometric, ~35.264°, by default), framed
-    orthographically to exactly fit the bounding box.
+    orthographically to exactly fit the asset's actual mesh silhouette (its
+    evaluated vertices, modifiers applied — see world_vertices()), not just
+    the bounding box: the box's own corners sit in empty space for any
+    non-boxy shape, and an isometric camera looks straight at that empty
+    space, which would otherwise show up as excess padding around anything
+    that isn't literally box-shaped.
   - Any OTHER Camera object in the scene (any name that isn't NE/NW/SE/SW)
     is also rendered, as an extra view keyed by its own object name — this
     is how you add a custom shot (an icon/portrait camera, say) alongside
@@ -119,14 +124,19 @@ Scene conventions:
     together must reconstruct full coverage, as an earlier version of this
     tool did) avoids a faint seam along the cutout's antialiased edge. An
     asset with no holdout-flagged object is unaffected by any of this — no
-    "overlay_image" ever appears, same as always. Holdout objects still
-    count toward the asset's own bounding box (see above), same as any
-    other mesh object, so author them to match the size/position of
-    whatever they represent (e.g. a stand-in copy of a head an accessory
-    sits on) if you want the frame sized/positioned to match it. Each
-    asset (top-level collection, or the whole scene with 0/1 of them) is
-    scanned for its own holdout-flagged objects independently of every
-    other asset's — there's no cross-collection reference or shared camera
+    "overlay_image" ever appears, same as always. Holdout objects are
+    excluded from the asset's own bounding box (see above) — the frame is
+    sized/positioned to the rest of the asset's geometry only, since
+    holdout objects are never rendered as color and so shouldn't be able to
+    stretch or shift the frame around their own extent (e.g. a stand-in
+    copy of a head an accessory sits on shouldn't force the frame wider
+    than the accessory itself just because the head is bigger). If every
+    mesh object in an asset is holdout-flagged, there's no non-holdout
+    geometry left to size a frame from, so the bounding box falls back to
+    all of the asset's mesh objects, holdout included. Each asset
+    (top-level collection, or the whole scene with 0/1 of them) is scanned
+    for its own holdout-flagged objects independently of every other
+    asset's — there's no cross-collection reference or shared camera
     involved.
 
 Usage:
@@ -193,9 +203,31 @@ def world_bounds(objects):
     return bbox_min, bbox_max
 
 
-def bbox_corners(bbox_min, bbox_max):
-    xs, ys, zs = (bbox_min.x, bbox_max.x), (bbox_min.y, bbox_max.y), (bbox_min.z, bbox_max.z)
-    return [Vector((x, y, z)) for x in xs for y in ys for z in zs]
+def world_vertices(depsgraph, objects):
+    """World-space positions of every vertex across `objects`'s evaluated
+    meshes (modifiers applied), for fitting a camera to the actual
+    silhouette rather than world_bounds()'s axis-aligned box — the box's
+    own corners sit in empty space for any non-boxy shape (a sphere, a
+    head), and an isometric camera looks straight at that empty space,
+    which is what produces visibly excess padding on round assets. Falls
+    back to that object's own (world-transformed) bound_box corners for
+    any object type to_mesh() can't evaluate (e.g. an Empty slipped into
+    the objects list, or an Armature)."""
+    points = []
+    for obj in objects:
+        eval_obj = obj.evaluated_get(depsgraph)
+        try:
+            mesh = eval_obj.to_mesh()
+        except RuntimeError:
+            mesh = None
+        if mesh is not None:
+            mat = eval_obj.matrix_world
+            points.extend(mat @ v.co for v in mesh.vertices)
+            eval_obj.to_mesh_clear()
+        else:
+            mat = eval_obj.matrix_world
+            points.extend(mat @ Vector(corner) for corner in eval_obj.bound_box)
+    return points
 
 
 def spawn_iso_camera(scene, label, azimuth, center, pitch_deg, distance):
@@ -215,12 +247,26 @@ def spawn_iso_camera(scene, label, azimuth, center, pitch_deg, distance):
     return cam_obj
 
 
-def fit_ortho_frame(cam_obj, corners, margin=1.02):
-    """Sets ortho_scale so the camera's horizontal axis exactly frames
-    `corners`, and returns (span_x, span_y) in world units for sizing the
-    render resolution."""
+def fit_ortho_frame(cam_obj, points, margin=1.02):
+    """Recenters `cam_obj` along its own local X/Y axes so `points`'s
+    local-space midpoint lands on the frame's center, then sets ortho_scale
+    so the camera's horizontal axis exactly frames them. Returns (span_x,
+    span_y) in world units for sizing the render resolution.
+
+    The recenter step is necessary because `points` is generally NOT
+    symmetric about the camera's aim point (world_bounds()'s AABB corners
+    always were, by construction, which is why this step wasn't needed
+    before points came from world_vertices() instead) — skipping it would
+    silently crop content on one side and add extra padding on the other."""
     mat_inv = cam_obj.matrix_world.inverted()
-    local = [mat_inv @ c for c in corners]
+    local = [mat_inv @ p for p in points]
+    xs, ys = [p.x for p in local], [p.y for p in local]
+    offset_x, offset_y = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+    cam_obj.location += cam_obj.matrix_world.to_3x3() @ Vector((offset_x, offset_y, 0))
+    bpy.context.view_layer.update()
+
+    mat_inv = cam_obj.matrix_world.inverted()
+    local = [mat_inv @ p for p in points]
     xs, ys = [p.x for p in local], [p.y for p in local]
     span_x = (max(xs) - min(xs)) * margin
     span_y = (max(ys) - min(ys)) * margin
@@ -333,12 +379,14 @@ def split_front_back(scene, cam_obj, image_png, overlay_png, res_x, res_y, base_
     return needed
 
 
-def compute_camera_set(scene, objects, bbox_min, bbox_max, pitch_deg, png_px_per_unit):
+def compute_camera_set(scene, objects, bbox_min, bbox_max, fit_points, pitch_deg, png_px_per_unit):
     """Matches/creates the standard-direction and extra cameras for
-    `objects`'s bounding box. Returns a dict of view key -> (cam_obj,
-    res_x, res_y), covering both standard directions and extra cameras."""
+    `objects`. Auto-generated standard-direction cameras are fit tightly to
+    `fit_points` (see world_vertices()) rather than the bounding box, since
+    the box's own corners overshoot the actual silhouette for anything that
+    isn't box-shaped. Returns a dict of view key -> (cam_obj, res_x,
+    res_y), covering both standard directions and extra cameras."""
     center = (bbox_min + bbox_max) / 2
-    corners = bbox_corners(bbox_min, bbox_max)
     distance = max((bbox_max - bbox_min).length, 1.0) * 4
 
     all_cams = [o for o in objects if o.type == "CAMERA"]
@@ -354,7 +402,7 @@ def compute_camera_set(scene, objects, bbox_min, bbox_max, pitch_deg, png_px_per
         cam_obj = standard_cams.get(label)
         if cam_obj is None:
             cam_obj = spawn_iso_camera(scene, label, azimuth, center, pitch_deg, distance)
-            span_x, span_y = fit_ortho_frame(cam_obj, corners)
+            span_x, span_y = fit_ortho_frame(cam_obj, fit_points)
             res_x = max(1, round(span_x * png_px_per_unit))
             res_y = max(1, round(span_y * png_px_per_unit))
         else:
@@ -447,13 +495,16 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
     if not mesh_objs:
         die(f"no mesh objects found for asset {asset_name!r} in {bpy.data.filepath}")
 
-    bbox_min, bbox_max = world_bounds(mesh_objs)
+    holdout_objs = [o for o in mesh_objs if o.is_holdout]
+    bbox_objs = [o for o in mesh_objs if not o.is_holdout] or mesh_objs
+    bbox_min, bbox_max = world_bounds(bbox_objs)
     size = bbox_max - bbox_min
 
-    camera_set = compute_camera_set(scene, objects, bbox_min, bbox_max, pitch_deg, png_px_per_unit)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    fit_points = world_vertices(depsgraph, bbox_objs)
+    camera_set = compute_camera_set(scene, objects, bbox_min, bbox_max, fit_points, pitch_deg, png_px_per_unit)
 
     empties = [o for o in objects if o.type == "EMPTY"]
-    holdout_objs = [o for o in mesh_objs if o.is_holdout]
     views = render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=holdout_objs or None)
 
     asset = {
