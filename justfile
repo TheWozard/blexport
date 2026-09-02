@@ -1,8 +1,11 @@
 export path="assets":
-    python3 export.py "{{path}}"
+    go run . export "{{path}}"
 
 force path="assets":
-    python3 export.py "{{path}}" --force
+    go run . export "{{path}}" --force
+
+build:
+    go build -o blexport .
 
 clean-backups path="assets":
     find "{{path}}" -name "*.blend[0-9]*" -delete

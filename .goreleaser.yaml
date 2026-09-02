@@ -1,0 +1,42 @@
+version: 2
+
+project_name: blexport
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: blexport
+    main: .
+    binary: blexport
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/TheWozard/blexport/internal/version.Version={{ .Version }}
+      - -X github.com/TheWozard/blexport/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/TheWozard/blexport/internal/version.Date={{ .Date }}
+
+archives:
+  - id: blexport
+    formats: [tar.gz]
+    name_template: "blexport_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

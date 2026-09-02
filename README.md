@@ -1,19 +1,27 @@
-# blender_export
+# blexport
 
 Renders `.blend` game assets into per-direction PNGs plus a JSON manifest, for a 45°-projection (isometric) game. Standalone and project-agnostic — point it at a directory of `.blend` files, get PNGs + `.json` manifests back.
 
 ## Requirements
 
-- Python 3.9+ (stdlib only — no pip installs needed)
 - [Blender](https://www.blender.org/download/) on `PATH` (`brew install --cask blender`)
+- Nothing else at runtime — `blexport` is a single static Go binary with the Blender-side script embedded in it.
+
+## Installation
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TheWozard/blexport/main/scripts/install.sh | bash
+```
+
+Installs to `~/.local/bin` by default (override with `BLEXPORT_INSTALL_DIR`). Or build from source: `go build -o blexport .` (requires Go 1.26+).
 
 ## Usage
 
 ```sh
-python3 export.py assets/                # render every stale .blend under assets/
-python3 export.py assets/hero.blend      # render a single asset
-python3 export.py assets/ --force        # re-render even if up to date
-python3 export.py assets/ --out renders/ # write output elsewhere instead of alongside each .blend
+blexport export assets/                # render every stale .blend under assets/
+blexport export assets/hero.blend      # render a single asset
+blexport export assets/ --force        # re-render even if up to date
+blexport export assets/ --out renders/ # write output elsewhere instead of alongside each .blend
 ```
 
 Output is written alongside each source `.blend` by default:

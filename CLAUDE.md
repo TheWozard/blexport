@@ -4,34 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A standalone, project-agnostic tool that renders `.blend` game assets into per-direction PNGs plus a JSON manifest, for a 45°-projection (isometric) game. Point it at a directory of `.blend` files, get PNGs + `.json` manifests back. No pip installs — Python 3.9+ stdlib only, plus a `blender` binary on `PATH`.
+A standalone, project-agnostic tool that renders `.blend` game assets into per-direction PNGs plus a JSON manifest, for a 45°-projection (isometric) game. Point it at a directory of `.blend` files, get PNGs + `.json` manifests back. Ships as a single static Go binary (`blexport`) — no runtime dependencies beyond a `blender` binary on `PATH`.
 
 ## Commands
 
-Prefer the `just` recipes below over calling `python3 export.py` / `find` directly — they're the intended entry points for this repo.
+Prefer the `just` recipes below over calling `go run .` / `find` directly — they're the intended entry points for this repo.
 
 ```sh
 just export              # render every stale .blend under assets/ (default path="assets")
 just export path/to/dir  # render a different directory or single .blend file
 just force               # re-render assets/ even if manifests are up to date
+just build                # build the blexport binary to ./blexport
 just clean-backups       # delete Blender's *.blend1/.blend2/... backup files under assets/
 just clean               # delete generated backups + *.json manifests + *.png renders under assets/ (keeps *.blend)
 ```
 
-Equivalent raw invocation (`export.py`'s own CLI, for flags not exposed via `just`):
+Equivalent raw invocation (`blexport export`'s own CLI, for flags not exposed via `just`):
 
 ```sh
-python3 export.py assets/ --out renders/ --px-per-unit 32 --supersample 4 --pitch 35.264
+go run . export assets/ --out renders/ --px-per-unit 32 --supersample 4 --pitch 35.264
 ```
 
-There is no test suite, linter, or build step in this repo — verification is empirical: run `just force` (or `just export`) against `assets/tile.blend` and inspect the resulting PNGs/JSON.
+`go build ./...`, `go vet ./...`, and `gofmt -l .` are the checks CI runs (`.github/workflows/ci.yml`). There is no test suite yet — verification is otherwise empirical: run `just force` (or `just export`) against `assets/example.blend` and inspect the resulting PNGs/JSON.
 
 ## Architecture
 
-Two-process pipeline, split because rendering requires Blender's Python (`bpy`) but the orchestration doesn't:
+Two-process pipeline, split because rendering requires Blender's own Python (`bpy`) but the orchestration doesn't:
 
-- **`export.py`** — the CLI entry point. Pure stdlib, no `bpy` dependency. Finds `.blend` files, checks manifest staleness (`.blend` mtime vs `.json` mtime), and for each stale asset shells out to `blender <asset>.blend --background --python blender_scene_export.py -- <out_dir> <px_per_unit> <png_px_per_unit> <pitch_deg>`. Reads back the JSON that script wrote and reports per-asset stats.
-- **`blender_scene_export.py`** — runs *inside* Blender's embedded Python via `--python` (not meant to be run directly; has `import bpy`). Does all the actual scene introspection, camera setup, rendering, and JSON manifest construction for one `.blend` file. Read the module docstring at the top of this file first — it's the authoritative spec for scene conventions and the manifest schema, kept in sync with the code by hand.
+- **`cmd/export.go`** (backed by `internal/blender`, `internal/manifest`) — the CLI entry point, a plain Go binary with no `bpy` dependency. Finds `.blend` files, checks manifest staleness (`.blend` mtime vs `.json` mtime), and for each stale asset shells out to `blender <asset>.blend --background --python <tmpdir>/blender_scene_export.py -- <out_dir> <px_per_unit> <png_px_per_unit> <pitch_deg>`, where `<tmpdir>` is a fresh directory holding both `blender_scene_export.py` and `shared_materials.blend`, written out from `go:embed`'d copies (Blender's `--python` flag needs a real path on disk, and `go:embed` can't reach outside its own package directory — so `internal/blender/{blender_scene_export.py,shared_materials.blend}` are the only copies of these files; don't recreate copies at the repo root). Both files must land in the *same* temp directory under their original names, since the script locates the materials file via `Path(__file__).parent / "shared_materials.blend"` — splitting them (e.g. reusing `os.CreateTemp` for just the script) silently breaks normal-map rendering with no error, it just finds no `normals` material and skips it. Reads back the JSON that script wrote and reports per-asset stats.
+- **`internal/blender/blender_scene_export.py`** — runs *inside* Blender's embedded Python via `--python` (not meant to be run directly; has `import bpy`). Does all the actual scene introspection, camera setup, rendering, and JSON manifest construction for one `.blend` file. Read the module docstring at the top of this file first — it's the authoritative spec for scene conventions and the manifest schema, kept in sync with the code by hand.
+- **`internal/blender/shared_materials.blend`** — the fallback library that provides the `normals` material (see below) for any asset that doesn't define its own. `SHARED_MATERIALS_BLEND = Path(__file__).parent / "shared_materials.blend"` in the script is what resolves it, so it always travels alongside the script wherever that gets written out.
+
+Distribution follows the `go-media-manage` pattern: `.goreleaser.yaml` cross-compiles `CGO_ENABLED=0` binaries for darwin/linux × amd64/arm64 on tagged pushes (`.github/workflows/release.yml`), `cmd/update.go` self-updates from the latest GitHub release, and `scripts/install.sh` is the curl-to-install entry point. None of that affects the `blender` runtime dependency — the compiled binary still shells out to whatever `blender` is on `PATH`, same as before.
 
 ### Scene conventions (how a `.blend` file should be authored)
 

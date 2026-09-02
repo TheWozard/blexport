@@ -1,4 +1,4 @@
-# Rendered output (regenerate with `python3 export.py`)
+# Rendered output (regenerate with `blexport export`)
 *.png
 *.json
 
@@ -10,6 +10,6 @@ assets/*
 # macOS
 .DS_Store
 
-# Python
-__pycache__/
-*.pyc
+# Go build artifacts
+/blexport
+/dist
