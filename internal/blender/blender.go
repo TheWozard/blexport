@@ -14,13 +14,7 @@ import (
 //go:embed blender_scene_export.py
 var sceneExportScript []byte
 
-//go:embed shared_materials.blend
-var sharedMaterials []byte
-
-const (
-	sceneExportScriptName = "blender_scene_export.py"
-	sharedMaterialsName   = "shared_materials.blend"
-)
+const sceneExportScriptName = "blender_scene_export.py"
 
 // Run invokes blender in the background against blendPath, running the
 // embedded scene-export script with the standard [out_dir, px_per_unit,
@@ -48,12 +42,9 @@ func Run(blendPath, outDir string, pxPerUnit, pngPxPerUnit, pitchDeg float64) er
 	return nil
 }
 
-// writeScriptDir materializes the embedded script and its shared_materials.blend
-// into a fresh temp directory, since blender's --python flag needs a real path
-// on disk and the script locates shared_materials.blend via
-// Path(__file__).parent — the two files must land side by side under the same
-// literal names they're embedded with. Each call gets its own directory so
-// concurrent Run calls don't collide.
+// writeScriptDir materializes the embedded script into a fresh temp
+// directory, since blender's --python flag needs a real path on disk. Each
+// call gets its own directory so concurrent Run calls don't collide.
 func writeScriptDir() (scriptPath string, cleanup func(), err error) {
 	dir, err := os.MkdirTemp("", "blexport-*")
 	if err != nil {
@@ -65,12 +56,6 @@ func writeScriptDir() (scriptPath string, cleanup func(), err error) {
 	if err := os.WriteFile(scriptPath, sceneExportScript, 0644); err != nil {
 		cleanup()
 		return "", nil, fmt.Errorf("writing embedded script: %w", err)
-	}
-
-	materialsPath := filepath.Join(dir, sharedMaterialsName)
-	if err := os.WriteFile(materialsPath, sharedMaterials, 0644); err != nil {
-		cleanup()
-		return "", nil, fmt.Errorf("writing embedded shared materials: %w", err)
 	}
 
 	return scriptPath, cleanup, nil

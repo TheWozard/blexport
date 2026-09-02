@@ -44,33 +44,45 @@ Scene conventions:
     is how you add a custom shot (an icon/portrait camera, say) alongside
     the 4 standard directions. Extra cameras are always rendered with their
     own settings, same as an explicitly-named standard camera.
-  - Every view is also rendered a second time with every object's material
-    overridden (bpy ViewLayer.material_override) to a Material named
-    "normals" (case-insensitive), producing a "*_normal.png" alongside that
-    view's regular image and a "normal_image" key in its manifest entry.
-    If the asset's own scene has such a material, that one is used —
-    otherwise one is linked in automatically from SHARED_MATERIALS_BLEND
-    (see ensure_normals_material()), so assets get normal maps for free
-    without each one needing its own copy. Add a "normals" material
-    directly to a specific asset only if it needs its own custom bake;
-    otherwise edit SHARED_MATERIALS_BLEND once and every asset picks it up.
-    That material's shader graph is what defines the bake: Geometry Normal
-    -> Vector Transform (World to Camera) -> encode to [0,1] -> Emission,
-    so the render captures each view's surface normal in that view's own
-    screen space (+X right, +Y up, +Z toward the viewer) instead of the
-    object's real appearance. Blender's Vector Transform node negates Z
-    relative to the camera object's own local axes (X/Y match the camera's
-    right/up exactly; verified empirically, not documented anywhere) — the
-    graph in SHARED_MATERIALS_BLEND multiplies by (1, 1, -1) right after
-    the Vector Transform to flip it back to "+Z toward the viewer" before
-    encoding. Preserve that flip if you ever rebuild the graph from scratch.
-    If neither the asset nor the shared file has a "normals" material, no
-    normal maps are rendered for that asset.
-    The normal-map render forces the scene's view transform to "Raw" for
-    that one render — the encoded [0,1] values are data, not a color to be
-    graded, so the artist's AgX/Filmic/etc. look (which is nonlinear and
-    would distort them, e.g. skewing hues and shrinking decoded vectors to
-    sub-unit length) must not touch them. The color pass is unaffected.
+  - Every material in the scene must be authored as a single Diffuse BSDF
+    node feeding directly into its Material Output's Surface input — that's
+    the only supported material setup (a hard error otherwise, see
+    diffuse_bsdf_node()) — because it's what every view's two bakes are
+    derived from, per material, instead of the scene's own lighting:
+      - "image" (always present) is an *albedo* pass: whatever feeds the
+        Diffuse BSDF's Color input is plugged into an Emission shader
+        instead, so the render is exactly that surface's own flat base
+        color, self-illuminated — no scene lighting, shadow, or shading
+        gradient baked in. A consuming engine applies all real lighting
+        itself at runtime, using this plus "normal_image" below.
+      - "normal_image" (always present) encodes each view's surface normal
+        in that view's own screen space (+X right, +Y up, +Z toward the
+        viewer), sourced from each material's own Diffuse BSDF Normal
+        input — whatever feeds it (a Bump/Normal Map node chain, or
+        nothing, meaning the implicit geometric shading normal) — rather
+        than a flat scene-wide override, so authored bump/normal-map detail
+        actually bakes in per material. Only one Vector Transform (World ->
+        Camera) is ever needed, inserted at that single Normal-input socket
+        (see _wire_normal_bake()): everything upstream of it already
+        resolves to a finished world-space normal by Blender's own BSDF
+        convention (that's what a Normal input expects), so there's no need
+        to hunt down and individually rewire every Geometry-normal
+        reference inside the graph. Blender's Vector Transform node negates
+        Z relative to the camera object's own local axes (X/Y match the
+        camera's right/up exactly; verified empirically, not documented
+        anywhere), so a multiply by (1, 1, -1) follows it to flip back to
+        "+Z toward the viewer", then a multiply-add by 0.5/0.5 encodes
+        [-1, 1] into [0, 1] before the final Emission. The render forces
+        view_settings.view_transform = "Raw" for this one pass — the
+        encoded values are data, not a color to be graded, so AgX/Filmic/
+        etc. (nonlinear, would skew hues and shrink decoded vectors to
+        sub-unit length) must not touch them. The color pass is unaffected.
+      Both bakes run on a temporary Material.copy() per source material
+      (see build_bake_materials()), swapped into every mesh object's
+      material slots only for that one render and always removed afterward
+      (swap_materials(), a finally block in render_views()) — the artist's
+      own material and node tree are never modified, and nothing from this
+      process is meant to persist in the .blend file.
   - For auto-generated cameras, render resolution is derived from the
     fitted frame × png_px_per_unit. For artist-placed cameras (standard or
     extra), the scene's existing render resolution is used as-is, since
@@ -147,6 +159,7 @@ Usage:
 import json
 import math
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import bpy
@@ -160,9 +173,6 @@ STANDARD_DIRECTIONS = {
     "SE": Vector((1, -1, 0)),
 }
 
-SHARED_MATERIALS_BLEND = Path(__file__).parent / "shared_materials.blend"
-
-
 def die(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -173,23 +183,115 @@ def sanitize_name(name: str) -> str:
     return name.lower()
 
 
-def find_material(name: str):
-    """Case-insensitive lookup of a Material by name, or None."""
-    return next((m for m in bpy.data.materials if m.name.lower() == name.lower()), None)
+def diffuse_bsdf_node(mat):
+    """The ShaderNodeBsdfDiffuse driving `mat`'s Material Output Surface
+    input, or None if `mat` isn't wired to that (the only supported)
+    convention."""
+    if mat is None or mat.node_tree is None:
+        return None
+    output = next(
+        (n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None
+    )
+    if output is None or not output.inputs["Surface"].is_linked:
+        return None
+    src = output.inputs["Surface"].links[0].from_node
+    return src if src.type == "BSDF_DIFFUSE" else None
 
 
-def ensure_normals_material():
-    """The asset's own "normals" material if it has one; otherwise one
-    appended from SHARED_MATERIALS_BLEND, so assets need not each carry
-    their own copy of the normal-map bake. None if neither has one."""
-    mat = find_material("normals")
-    if mat is not None or not SHARED_MATERIALS_BLEND.exists():
-        return mat
-    with bpy.data.libraries.load(str(SHARED_MATERIALS_BLEND), link=False) as (data_from, data_to):
-        if "normals" not in data_from.materials:
-            return None
-        data_to.materials = ["normals"]
-    return data_to.materials[0]
+def _replace_surface_with_emission(tree, color_socket_or_value):
+    """Points `tree`'s active Material Output Surface at a fresh Emission
+    shader instead, fed by `color_socket_or_value` (an output socket to
+    link, or a plain RGBA value)."""
+    output = next(n for n in tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output)
+    emission = tree.nodes.new("ShaderNodeEmission")
+    if isinstance(color_socket_or_value, bpy.types.NodeSocket):
+        tree.links.new(color_socket_or_value, emission.inputs["Color"])
+    else:
+        emission.inputs["Color"].default_value = color_socket_or_value
+    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+
+
+def _wire_color_bake(mat):
+    """Rewires `mat` (already a throwaway copy) so its Surface is an
+    Emission of whatever fed its Diffuse BSDF's Color input — the albedo
+    pass described in the module docstring."""
+    bsdf = diffuse_bsdf_node(mat)
+    color_in = bsdf.inputs["Color"]
+    source = color_in.links[0].from_socket if color_in.is_linked else color_in.default_value
+    _replace_surface_with_emission(mat.node_tree, source)
+
+
+def _wire_normal_bake(mat):
+    """Rewires `mat` (already a throwaway copy) so its Surface is an
+    Emission of its Diffuse BSDF's Normal input, transformed into camera
+    space and encoded to [0,1] — the normal-map pass described in the
+    module docstring. Only one Vector Transform is needed, inserted at this
+    single Normal-input socket, since whatever feeds it already resolves to
+    a finished world-space normal by Blender's own BSDF convention."""
+    tree = mat.node_tree
+    bsdf = diffuse_bsdf_node(mat)
+    normal_in = bsdf.inputs["Normal"]
+    if normal_in.is_linked:
+        source = normal_in.links[0].from_socket
+    else:
+        source = tree.nodes.new("ShaderNodeNewGeometry").outputs["Normal"]
+
+    transform = tree.nodes.new("ShaderNodeVectorTransform")
+    transform.vector_type = "NORMAL"
+    transform.convert_from = "WORLD"
+    transform.convert_to = "CAMERA"
+    tree.links.new(source, transform.inputs["Vector"])
+
+    flip = tree.nodes.new("ShaderNodeVectorMath")
+    flip.operation = "MULTIPLY"
+    flip.inputs[1].default_value = (1.0, 1.0, -1.0)
+    tree.links.new(transform.outputs["Vector"], flip.inputs[0])
+
+    encode = tree.nodes.new("ShaderNodeVectorMath")
+    encode.operation = "MULTIPLY_ADD"
+    encode.inputs[1].default_value = (0.5, 0.5, 0.5)
+    encode.inputs[2].default_value = (0.5, 0.5, 0.5)
+    tree.links.new(flip.outputs["Vector"], encode.inputs[0])
+
+    _replace_surface_with_emission(tree, encode.outputs["Vector"])
+
+
+def build_bake_materials(mat, cache):
+    """(color_mat, normal_mat) throwaway Material.copy()s of `mat`, rewired
+    for the albedo and normal-map passes (see _wire_color_bake()/
+    _wire_normal_bake()). Cached in `cache` (keyed by `mat.name`) since
+    multiple objects/slots commonly share one source material — built once,
+    reused for every view. Dies if `mat` has no Diffuse BSDF driving its
+    Surface output; there's no fallback material or convention anymore."""
+    if mat.name not in cache:
+        if diffuse_bsdf_node(mat) is None:
+            die(
+                f"material {mat.name!r} must have a Diffuse BSDF connected directly to its "
+                f"Material Output Surface input (the only supported material setup) in {bpy.data.filepath}"
+            )
+        color_mat, normal_mat = mat.copy(), mat.copy()
+        _wire_color_bake(color_mat)
+        _wire_normal_bake(normal_mat)
+        cache[mat.name] = (color_mat, normal_mat)
+    return cache[mat.name]
+
+
+@contextmanager
+def swap_materials(objects, mat_for):
+    """Temporarily replaces every material slot across `objects` with
+    `mat_for(original_material)`, restoring the originals on exit (even on
+    error). Slots with no material assigned are left untouched."""
+    originals = []
+    for obj in objects:
+        for slot in obj.material_slots:
+            if slot.material is not None:
+                originals.append((slot, slot.material))
+                slot.material = mat_for(slot.material)
+    try:
+        yield
+    finally:
+        for slot, mat in originals:
+            slot.material = mat
 
 
 def world_bounds(objects):
@@ -307,6 +409,19 @@ def anchor_visible(scene, depsgraph, cam_obj, target, eps=1e-4):
     return not hit
 
 
+def raw_view_transform_available(scene):
+    """False if this Blender has no "Raw" view transform to select — some
+    distro Blender packages link against a system OpenColorIO older than
+    the color-management config they ship, so OCIO fails to load and
+    Blender falls back to a minimal "Standard"-only color-management mode
+    with no "Raw" (or AgX/Filmic) available at all. render_views() warns
+    and skips forcing "Raw" for the normal-map pass in that case rather
+    than crashing — the encoded values may come out lightly tone-mapped by
+    whatever view transform the scene already has, but the export still
+    completes instead of failing outright over unrelated OCIO packaging."""
+    return "Raw" in scene.view_settings.bl_rna.properties["view_transform"].enum_items.keys()
+
+
 def render_camera(scene, cam_obj, out_png, resolution_x, resolution_y):
     scene.camera = cam_obj
     scene.render.resolution_x = resolution_x
@@ -368,8 +483,8 @@ def split_front_back(scene, cam_obj, image_png, overlay_png, res_x, res_y, base_
 
     image_img = bpy.data.images.load(str(image_png))
     overlay_img = bpy.data.images.load(str(overlay_png))
-    image_alpha = image_img.pixels[3::4]
-    overlay_alpha = overlay_img.pixels[3::4]
+    image_alpha = list(image_img.pixels)[3::4]
+    overlay_alpha = list(overlay_img.pixels)[3::4]
     needed = any(a - b > alpha_eps for a, b in zip(image_alpha, overlay_alpha))
     bpy.data.images.remove(image_img)
     bpy.data.images.remove(overlay_img)
@@ -417,7 +532,7 @@ def compute_camera_set(scene, objects, bbox_min, bbox_max, fit_points, pitch_deg
     return {**standard_render, **extra_render}
 
 
-def render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=None):
+def render_views(scene, out_dir, name_prefix, camera_set, empties, mesh_objs, base_objects=None):
     """Renders each view in `camera_set` (key -> (cam_obj, res_x, res_y)),
     writing "<name_prefix>_<view>[_normal].png" files, and returns this
     asset's `views` manifest dict. If `base_objects` is given (this asset's
@@ -425,7 +540,10 @@ def render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=
     complete view (those objects hidden entirely) and views where they
     actually occlude something also get an "overlay_image" (see
     split_front_back() and the module docstring's front/back-split
-    section)."""
+    section). `mesh_objs` is every mesh object in this asset (base_objects
+    included) — each one's own material drives the "image" (albedo) and
+    "normal_image" bakes, always present now (see build_bake_materials()/
+    swap_materials() and the module docstring)."""
     depsgraph = bpy.context.evaluated_depsgraph_get()
 
     def anchors_for(cam_obj):
@@ -438,49 +556,71 @@ def render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=
             }
         return result
 
-    normals_material = ensure_normals_material()
-    view_layer = bpy.context.view_layer
+    bake_cache = {}
+    for obj in mesh_objs:
+        for slot in obj.material_slots:
+            if slot.material is not None:
+                build_bake_materials(slot.material, bake_cache)  # dies eagerly on an unsupported material
+    color_mat_for = lambda mat: build_bake_materials(mat, bake_cache)[0]
+    normal_mat_for = lambda mat: build_bake_materials(mat, bake_cache)[1]
 
-    views = {}
-    for key, (cam_obj, res_x, res_y) in camera_set.items():
-        out_png = out_dir / f"{name_prefix}_{key}.png"
-        overlay_needed = False
-        if base_objects is None:
-            render_camera(scene, cam_obj, out_png, res_x, res_y)
-        else:
-            out_overlay_png = out_dir / f"{name_prefix}_{key}_overlay.png"
-            overlay_needed = split_front_back(scene, cam_obj, out_png, out_overlay_png, res_x, res_y, base_objects)
+    raw_available = raw_view_transform_available(scene)
+    if not raw_available:
+        print(
+            "warning: this Blender's color management has no \"Raw\" view transform available "
+            "(likely a broken/mismatched OCIO config) — normal_image values may be tone-mapped "
+            "by whatever view transform the scene already has",
+            file=sys.stderr,
+        )
 
-        view = {
-            "image": out_png.name,
-            "render_width_px": res_x,
-            "render_height_px": res_y,
-            "anchors": anchors_for(cam_obj),
-        }
-        if overlay_needed:
-            view["overlay_image"] = out_overlay_png.name
-        print(f"rendered {out_png.name}: {res_x}x{res_y}")
+    try:
+        views = {}
+        for key, (cam_obj, res_x, res_y) in camera_set.items():
+            out_png = out_dir / f"{name_prefix}_{key}.png"
+            overlay_needed = False
+            with swap_materials(mesh_objs, color_mat_for):
+                if base_objects is None:
+                    render_camera(scene, cam_obj, out_png, res_x, res_y)
+                else:
+                    out_overlay_png = out_dir / f"{name_prefix}_{key}_overlay.png"
+                    overlay_needed = split_front_back(
+                        scene, cam_obj, out_png, out_overlay_png, res_x, res_y, base_objects
+                    )
 
-        if normals_material is not None:
+            view = {
+                "image": out_png.name,
+                "render_width_px": res_x,
+                "render_height_px": res_y,
+                "anchors": anchors_for(cam_obj),
+            }
+            if overlay_needed:
+                view["overlay_image"] = out_overlay_png.name
+            print(f"rendered {out_png.name}: {res_x}x{res_y}")
+
             out_normal_png = out_dir / f"{name_prefix}_{key}_normal.png"
-            view_layer.material_override = normals_material
             view_transform = scene.view_settings.view_transform
-            scene.view_settings.view_transform = "Raw"
-            if base_objects is None:
-                render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
-            else:
-                original_hide = [(obj, obj.hide_render) for obj in base_objects]
-                for obj in base_objects:
-                    obj.hide_render = True
-                render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
-                for obj, hide_render in original_hide:
-                    obj.hide_render = hide_render
-            scene.view_settings.view_transform = view_transform
-            view_layer.material_override = None
+            if raw_available:
+                scene.view_settings.view_transform = "Raw"
+            with swap_materials(mesh_objs, normal_mat_for):
+                if base_objects is None:
+                    render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
+                else:
+                    original_hide = [(obj, obj.hide_render) for obj in base_objects]
+                    for obj in base_objects:
+                        obj.hide_render = True
+                    render_camera(scene, cam_obj, out_normal_png, res_x, res_y)
+                    for obj, hide_render in original_hide:
+                        obj.hide_render = hide_render
+            if raw_available:
+                scene.view_settings.view_transform = view_transform
             view["normal_image"] = out_normal_png.name
             print(f"rendered {out_normal_png.name}: {res_x}x{res_y}")
 
-        views[key] = view
+            views[key] = view
+    finally:
+        for color_mat, normal_mat in bake_cache.values():
+            bpy.data.materials.remove(color_mat)
+            bpy.data.materials.remove(normal_mat)
 
     return views
 
@@ -505,7 +645,9 @@ def render_asset(scene, objects, out_dir, name_prefix, asset_name, px_per_unit, 
     camera_set = compute_camera_set(scene, objects, bbox_min, bbox_max, fit_points, pitch_deg, png_px_per_unit)
 
     empties = [o for o in objects if o.type == "EMPTY"]
-    views = render_views(scene, out_dir, name_prefix, camera_set, empties, base_objects=holdout_objs or None)
+    views = render_views(
+        scene, out_dir, name_prefix, camera_set, empties, mesh_objs, base_objects=holdout_objs or None
+    )
 
     asset = {
         "asset": {
